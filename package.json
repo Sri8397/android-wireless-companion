@@ -25,7 +25,9 @@
   "main": "./out/extension.js",
   "activationEvents": [
     "onStartupFinished",
-    "onView:androidWirelessDevices"
+    "onView:androidWirelessActions",
+    "onView:androidWirelessDevices",
+    "onView:androidWirelessTools"
   ],
   "scripts": {
     "vscode:prepublish": "npm run compile",
@@ -46,8 +48,16 @@
     "views": {
       "android-wireless-panel": [
         {
+          "id": "androidWirelessActions",
+          "name": "Screen & Deploy"
+        },
+        {
           "id": "androidWirelessDevices",
-          "name": "Controller"
+          "name": "Connected Devices"
+        },
+        {
+          "id": "androidWirelessTools",
+          "name": "Wireless Debugging"
         }
       ]
     },
@@ -60,13 +70,55 @@
       {
         "command": "androidWireless.captureScreenshot",
         "title": "Capture Screenshot for AI",
-        "icon": "$(camera)",
+        "icon": "$(device-camera)",
+        "category": "SUVIDHA"
+      },
+      {
+        "command": "androidWireless.deployApp",
+        "title": "Deploy App...",
+        "icon": "$(rocket)",
         "category": "SUVIDHA"
       },
       {
         "command": "androidWireless.deployAllDevices",
         "title": "Deploy to All Connected Devices",
-        "icon": "$(rocket)",
+        "icon": "$(run-all)",
+        "category": "SUVIDHA"
+      },
+      {
+        "command": "androidWireless.selectDevice",
+        "title": "Select Active Device",
+        "icon": "$(check)",
+        "category": "SUVIDHA"
+      },
+      {
+        "command": "androidWireless.deviceActions",
+        "title": "Device Actions...",
+        "icon": "$(gear)",
+        "category": "SUVIDHA"
+      },
+      {
+        "command": "androidWireless.pairDevice",
+        "title": "Pair Device (Wireless Debugging)",
+        "icon": "$(link)",
+        "category": "SUVIDHA"
+      },
+      {
+        "command": "androidWireless.connectDevice",
+        "title": "Connect Wireless Device (IP:Port)",
+        "icon": "$(radio-tower)",
+        "category": "SUVIDHA"
+      },
+      {
+        "command": "androidWireless.disconnectDevice",
+        "title": "Disconnect Wireless Device",
+        "icon": "$(debug-disconnect)",
+        "category": "SUVIDHA"
+      },
+      {
+        "command": "androidWireless.refreshDevices",
+        "title": "Refresh Devices",
+        "icon": "$(refresh)",
         "category": "SUVIDHA"
       }
     ],
@@ -74,17 +126,42 @@
       "view/title": [
         {
           "command": "androidWireless.launchVirtualDisplay",
+          "when": "view == androidWirelessActions",
+          "group": "navigation@1"
+        },
+        {
+          "command": "androidWireless.deployApp",
+          "when": "view == androidWirelessActions",
+          "group": "navigation@2"
+        },
+        {
+          "command": "androidWireless.captureScreenshot",
+          "when": "view == androidWirelessActions",
+          "group": "navigation@3"
+        },
+        {
+          "command": "androidWireless.selectDevice",
           "when": "view == androidWirelessDevices",
           "group": "navigation@1"
         },
         {
-          "command": "androidWireless.captureScreenshot",
+          "command": "androidWireless.refreshDevices",
           "when": "view == androidWirelessDevices",
           "group": "navigation@2"
         },
         {
-          "command": "androidWireless.deployAllDevices",
-          "when": "view == androidWirelessDevices",
+          "command": "androidWireless.pairDevice",
+          "when": "view == androidWirelessTools",
+          "group": "navigation@1"
+        },
+        {
+          "command": "androidWireless.connectDevice",
+          "when": "view == androidWirelessTools",
+          "group": "navigation@2"
+        },
+        {
+          "command": "androidWireless.refreshDevices",
+          "when": "view == androidWirelessTools",
           "group": "navigation@3"
         }
       ]

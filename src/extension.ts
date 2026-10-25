@@ -4,12 +4,27 @@ import { spawn } from 'child_process';
 import * as net from 'net';
 import * as fs from 'fs';
 import * as path from 'path';
+import { deployApp, deployToAllDevices } from './deploy';
 
 // ─── Scrcpy Protocol Constants ──────────────────────────────────────────────
 const SCRCPY_VERSION = '5.0.1';
 const DEVICE_SERVER_PATH = '/data/local/tmp/scrcpy-server.jar';
 const DEFAULT_APP_NAME = 'SUVIDHA';
 const DEFAULT_APP_PACKAGE = 'com.just_sri.suvidha.expenses';
+
+export function getAdbPath(): string {
+    const home = process.env.HOME || '';
+    const adbCandidates = [
+        process.env.ANDROID_HOME ? path.join(process.env.ANDROID_HOME, 'platform-tools', 'adb') : '',
+        process.env.ANDROID_SDK_ROOT ? path.join(process.env.ANDROID_SDK_ROOT, 'platform-tools', 'adb') : '',
+        path.join(home, 'Library', 'Android', 'sdk', 'platform-tools', 'adb'),
+        path.join(home, 'Android', 'Sdk', 'platform-tools', 'adb'),
+        '/opt/homebrew/bin/adb',
+        '/usr/local/bin/adb',
+        'adb',
+    ];
+    return adbCandidates.find(p => p && (p === 'adb' || fs.existsSync(p))) || 'adb';
+}
 
 function getConfiguredString(key: string, fallback: string): string {
     const configured = vscode.workspace
@@ -627,17 +642,7 @@ class EmbeddedMirrorPanel {
     constructor(context: vscode.ExtensionContext) {
         this.context = context;
         this.output = this.createOutputChannel();
-        const home = process.env.HOME || '';
-        const adbCandidates = [
-            process.env.ANDROID_HOME ? path.join(process.env.ANDROID_HOME, 'platform-tools', 'adb') : '',
-            process.env.ANDROID_SDK_ROOT ? path.join(process.env.ANDROID_SDK_ROOT, 'platform-tools', 'adb') : '',
-            path.join(home, 'Library', 'Android', 'sdk', 'platform-tools', 'adb'),
-            path.join(home, 'Android', 'Sdk', 'platform-tools', 'adb'),
-            '/opt/homebrew/bin/adb',
-            '/usr/local/bin/adb',
-            'adb',
-        ];
-        this.adbPath = adbCandidates.find(p => p && (p === 'adb' || fs.existsSync(p))) || 'adb';
+        this.adbPath = getAdbPath();
         this.log(`adb: ${this.adbPath}`);
 
         context.subscriptions.push(
@@ -715,17 +720,42 @@ class EmbeddedMirrorPanel {
         });
     }
 
-    public async launch(): Promise<void> {
-        if (this.panel) {
-            this.panel.reveal(vscode.ViewColumn.Beside);
+    public async launch(targetSerial?: string): Promise<void> {
+        let serial = targetSerial;
+        if (!serial) {
+            serial = await this.findDevice();
+        }
+        if (!serial) {
+            vscode.window.showErrorMessage(
+                '⚠️ No Android device found. Pair or Connect via Wireless Debugging in the Controller sidebar.',
+                'Pair Device',
+                'Connect Device'
+            ).then((choice) => {
+                if (choice === 'Pair Device') {
+                    vscode.commands.executeCommand('androidWireless.pairDevice');
+                } else if (choice === 'Connect Device') {
+                    vscode.commands.executeCommand('androidWireless.connectDevice');
+                }
+            });
             return;
         }
 
-        const serial = await this.findDevice();
-        if (!serial) {
-            vscode.window.showErrorMessage('⚠️ No Android device found. Enable Wireless Debugging on your phone.');
+        if (this.panel) {
+            this.panel.reveal(vscode.ViewColumn.Beside);
+            if (this.serial !== serial) {
+                this.log(`switching display to device: ${serial}`);
+                this.serial = serial;
+                this.deviceName = '';
+                this.updatePanelTitle();
+                this.stop();
+                this.disposed = false;
+                const useVirtual = vscode.workspace.getConfiguration('suvidha').get<boolean>('virtualDisplay', true);
+                this.startMonitor(serial);
+                await this.connect(serial, useVirtual);
+            }
             return;
         }
+
         this.serial = serial;
 
         // Create WebviewPanel
@@ -899,7 +929,7 @@ class EmbeddedMirrorPanel {
             this.reconnectTimer = undefined;
             if (this.disposed || !this.panel) return;
 
-            const serial = await this.findDevice();
+            const serial = this.serial || await this.findDevice();
             if (!serial) {
                 this.scheduleReconnect('No adb device yet (is Wireless debugging still on?)');
                 return;
@@ -1760,41 +1790,580 @@ class EmbeddedMirrorPanel {
     }
 }
 
-// ─── Sidebar Controller ─────────────────────────────────────────────────────
-class ControllerProvider implements vscode.TreeDataProvider<vscode.TreeItem>, vscode.Disposable {
+// ─── Wireless Device Helpers ────────────────────────────────────────────────
+interface ConnectedDevice {
+    serial: string;
+    isWireless: boolean;
+    model: string;
+}
+
+async function listConnectedDevices(adbPath: string): Promise<ConnectedDevice[]> {
+    return new Promise((resolve) => {
+        cp.execFile(adbPath, ['devices', '-l'], { timeout: 6000 }, (err, stdout) => {
+            if (err || !stdout) {
+                return resolve([]);
+            }
+            const lines = stdout.trim().split('\n').slice(1);
+            const list: ConnectedDevice[] = [];
+            for (const line of lines) {
+                const parts = line.trim().split(/\s+/);
+                if (parts.length >= 2 && parts[1] === 'device') {
+                    const serial = parts[0];
+                    const isWireless = serial.includes(':') || serial.includes('_tcp');
+                    const modelMatch = line.match(/model:(\S+)/);
+                    const model = modelMatch ? modelMatch[1].replace(/_/g, ' ') : '';
+                    list.push({ serial, isWireless, model });
+                }
+            }
+            resolve(list);
+        });
+    });
+}
+
+async function restartAdbServer(adbPath: string): Promise<void> {
+    await vscode.window.withProgress(
+        {
+            location: vscode.ProgressLocation.Notification,
+            title: 'Restarting ADB Server...',
+            cancellable: false
+        },
+        async () => {
+            return new Promise<void>((resolve) => {
+                cp.execFile(adbPath, ['kill-server'], { timeout: 6000 }, () => {
+                    cp.execFile(adbPath, ['start-server'], { timeout: 8000 }, () => {
+                        cp.execFile(adbPath, ['version'], { timeout: 4000 }, (verErr, verStdout) => {
+                            const firstLine = (verStdout || '').split('\n')[0]?.trim() || 'ADB server active';
+                            vscode.window.showInformationMessage(`🔄 ${firstLine}`);
+                            resolve();
+                        });
+                    });
+                });
+            });
+        }
+    );
+}
+
+async function pairWirelessDevice(adbPath: string, context: vscode.ExtensionContext): Promise<boolean> {
+    const lastHost = context.globalState.get<string>('lastAdbHost', '');
+    const ipPort = await vscode.window.showInputBox({
+        title: 'Step 1 of 2: Pair Device (Wireless Debugging)',
+        prompt: 'Enter IP address & port from phone "Pair device with pairing code"',
+        placeHolder: 'e.g. 192.168.1.15:38153',
+        value: lastHost ? `${lastHost}:` : '',
+        ignoreFocusOut: true,
+        validateInput: (val) => {
+            if (!val || !val.trim()) return 'Please enter IP address and port (e.g. 192.168.1.15:38153)';
+            if (!val.includes(':')) return 'Must be in format IP:PORT (e.g. 192.168.1.15:38153)';
+            return null;
+        }
+    });
+
+    if (!ipPort) return false;
+
+    const trimmedIpPort = ipPort.trim();
+    const hostPart = trimmedIpPort.split(':')[0];
+    if (hostPart) {
+        context.globalState.update('lastAdbHost', hostPart);
+    }
+
+    const pairingCode = await vscode.window.showInputBox({
+        title: 'Step 2 of 2: 6-digit Wi-Fi Pairing Code',
+        prompt: 'Enter the 6-digit code shown on your phone',
+        placeHolder: 'e.g. 841030',
+        ignoreFocusOut: true,
+        validateInput: (val) => {
+            if (!val || !val.trim()) return 'Pairing code cannot be empty';
+            if (!/^\d{6}$/.test(val.trim())) return 'Pairing code is usually a 6-digit number';
+            return null;
+        }
+    });
+
+    if (!pairingCode) return false;
+
+    return vscode.window.withProgress(
+        {
+            location: vscode.ProgressLocation.Notification,
+            title: `Pairing with ${trimmedIpPort}...`,
+            cancellable: false
+        },
+        async () => {
+            return new Promise<boolean>((resolve) => {
+                cp.execFile(adbPath, ['pair', trimmedIpPort, pairingCode.trim()], { timeout: 15000 }, async (err, stdout, stderr) => {
+                    const output = ((stdout || '') + ' ' + (stderr || '')).trim();
+                    if (!err && output.toLowerCase().includes('successfully paired')) {
+                        const choice = await vscode.window.showInformationMessage(
+                            `🎉 Successfully paired with ${trimmedIpPort}!`,
+                            'Connect Now'
+                        );
+                        if (choice === 'Connect Now') {
+                            await connectWirelessDevice(adbPath, context, hostPart);
+                        }
+                        resolve(true);
+                    } else {
+                        vscode.window.showErrorMessage(`Failed to pair with ${trimmedIpPort}: ${output || err?.message}`);
+                        resolve(false);
+                    }
+                });
+            });
+        }
+    );
+}
+
+async function connectWirelessDevice(
+    adbPath: string,
+    context: vscode.ExtensionContext,
+    defaultHost?: string
+): Promise<boolean> {
+    const lastHost = defaultHost || context.globalState.get<string>('lastAdbHost', '');
+    const ipPort = await vscode.window.showInputBox({
+        title: 'Connect to Wireless Device',
+        prompt: 'Enter IP address & port from phone "Wireless debugging" screen',
+        placeHolder: 'e.g. 192.168.1.15:33617',
+        value: lastHost ? `${lastHost}:` : '',
+        ignoreFocusOut: true,
+        validateInput: (val) => {
+            if (!val || !val.trim()) return 'Please enter IP address and port (e.g. 192.168.1.15:33617)';
+            if (!val.includes(':')) return 'Must be in format IP:PORT (e.g. 192.168.1.15:33617)';
+            return null;
+        }
+    });
+
+    if (!ipPort) return false;
+
+    const trimmedIpPort = ipPort.trim();
+    const hostPart = trimmedIpPort.split(':')[0];
+    if (hostPart) {
+        context.globalState.update('lastAdbHost', hostPart);
+    }
+
+    return vscode.window.withProgress(
+        {
+            location: vscode.ProgressLocation.Notification,
+            title: `Connecting to ${trimmedIpPort}...`,
+            cancellable: false
+        },
+        async () => {
+            return new Promise<boolean>((resolve) => {
+                cp.execFile(adbPath, ['connect', trimmedIpPort], { timeout: 10000 }, async (err, stdout, stderr) => {
+                    const output = ((stdout || '') + ' ' + (stderr || '')).trim();
+                    if (!err && output.toLowerCase().includes('connected to')) {
+                        const choice = await vscode.window.showInformationMessage(
+                            `✅ Connected to ${trimmedIpPort}!`,
+                            `Open ${getAppName()} Screen`
+                        );
+                        if (choice) {
+                            vscode.commands.executeCommand('androidWireless.launchVirtualDisplay');
+                        }
+                        resolve(true);
+                    } else {
+                        vscode.window.showErrorMessage(`Could not connect to ${trimmedIpPort}: ${output || err?.message}`);
+                        resolve(false);
+                    }
+                });
+            });
+        }
+    );
+}
+
+async function disconnectWirelessDevice(adbPath: string, specificSerial?: string): Promise<void> {
+    const devices = await listConnectedDevices(adbPath);
+    const wireless = devices.filter(d => d.isWireless);
+
+    if (wireless.length === 0) {
+        vscode.window.showInformationMessage('No wireless ADB devices currently connected.');
+        return;
+    }
+
+    let serialToDisconnect = specificSerial;
+
+    if (!serialToDisconnect) {
+        if (wireless.length === 1) {
+            serialToDisconnect = wireless[0].serial;
+        } else {
+            const items = [
+                ...wireless.map(d => ({ label: `$(device-mobile) ${d.serial}`, description: d.model, serial: d.serial })),
+                { label: '$(trash) Disconnect All Wireless Devices', description: '', serial: 'ALL' }
+            ];
+
+            const pick = await vscode.window.showQuickPick(items, {
+                placeHolder: 'Select a wireless device to disconnect'
+            });
+
+            if (!pick) return;
+            serialToDisconnect = pick.serial;
+        }
+    }
+
+    return new Promise((resolve) => {
+        const args = serialToDisconnect === 'ALL' ? ['disconnect'] : ['disconnect', serialToDisconnect!];
+        cp.execFile(adbPath, args, { timeout: 6000 }, () => {
+            vscode.window.showInformationMessage(
+                serialToDisconnect === 'ALL' ? 'Disconnected all wireless ADB devices.' : `Disconnected ${serialToDisconnect}.`
+            );
+            vscode.commands.executeCommand('androidWireless.refreshDevices');
+            resolve();
+        });
+    });
+}
+
+async function showDeviceActions(
+    dev: ConnectedDevice,
+    controllerProvider: ControllerProvider,
+    adbPath: string
+): Promise<void> {
+    const isSelected = dev.serial === controllerProvider.getSelectedSerial();
+    const appName = getAppName();
+    const devName = dev.model ? `${dev.model} (${dev.serial})` : dev.serial;
+
+    interface ActionPickItem extends vscode.QuickPickItem {
+        actionId: 'select' | 'screen' | 'deploy' | 'disconnect';
+    }
+
+    const items: ActionPickItem[] = [];
+
+    if (!isSelected) {
+        items.push({
+            label: '$(check) Set as Active Device',
+            description: `Target ${dev.model || dev.serial} by default for Screen & Deploy`,
+            actionId: 'select'
+        });
+    }
+
+    items.push({
+        label: `$(device-mobile) Open ${appName} Screen`,
+        description: `Launch screen for ${dev.model || dev.serial}`,
+        actionId: 'screen'
+    });
+
+    items.push({
+        label: `$(rocket) Deploy App to this Device`,
+        description: `Build debug APK and launch on ${dev.model || dev.serial}`,
+        actionId: 'deploy'
+    });
+
+    if (dev.isWireless) {
+        items.push({
+            label: `$(debug-disconnect) Disconnect Wireless Device`,
+            description: `Disconnect ${dev.serial}`,
+            actionId: 'disconnect'
+        });
+    }
+
+    const pick = await vscode.window.showQuickPick(items, {
+        placeHolder: `Action for ${devName}`
+    });
+
+    if (!pick) return;
+
+    if (pick.actionId === 'select') {
+        controllerProvider.setSelectedSerial(dev.serial);
+        vscode.window.showInformationMessage(`Active device set to: ${dev.model || dev.serial}`);
+    } else if (pick.actionId === 'screen') {
+        controllerProvider.setSelectedSerial(dev.serial);
+        vscode.commands.executeCommand('androidWireless.launchVirtualDisplay', dev.serial);
+    } else if (pick.actionId === 'deploy') {
+        controllerProvider.setSelectedSerial(dev.serial);
+        vscode.commands.executeCommand('androidWireless.deployApp', dev.serial);
+    } else if (pick.actionId === 'disconnect') {
+        await disconnectWirelessDevice(adbPath, dev.serial);
+        controllerProvider.refresh();
+    }
+}
+
+async function selectActiveDevice(
+    controllerProvider: ControllerProvider,
+    adbPath: string
+): Promise<void> {
+    const devices = await listConnectedDevices(adbPath);
+    if (devices.length === 0) {
+        vscode.window.showErrorMessage('No connected ADB devices found.');
+        return;
+    }
+
+    const activeSerial = controllerProvider.getSelectedSerial();
+    const items = devices.map(d => ({
+        label: d.model ? `${d.model} (${d.serial})` : d.serial,
+        description: `${d.serial === activeSerial ? '✓ Active • ' : ''}${d.isWireless ? 'Wireless' : 'USB'}`,
+        serial: d.serial
+    }));
+
+    const pick = await vscode.window.showQuickPick(items, {
+        placeHolder: 'Select an Android device to set as active target'
+    });
+
+    if (pick) {
+        controllerProvider.setSelectedSerial(pick.serial);
+        vscode.window.showInformationMessage(`Active device set to: ${pick.label}`);
+    }
+}
+
+// ─── Sidebar Controller & Categorized Providers ─────────────────────────────
+class ControllerProvider implements vscode.Disposable {
     private readonly onDidChangeTreeDataEmitter = new vscode.EventEmitter<void>();
-    readonly onDidChangeTreeData = this.onDidChangeTreeDataEmitter.event;
+    public readonly onDidChangeTreeData = this.onDidChangeTreeDataEmitter.event;
+
+    public readonly actionsProvider: ActionsProvider;
+    public readonly devicesProvider: DevicesProvider;
+    public readonly toolsProvider: ToolsProvider;
+
+    private actionsTreeView?: vscode.TreeView<vscode.TreeItem>;
+    private devicesTreeView?: vscode.TreeView<vscode.TreeItem>;
+    private toolsTreeView?: vscode.TreeView<vscode.TreeItem>;
+
+    private adbPath: string;
+    private context: vscode.ExtensionContext;
+    private selectedSerial: string | undefined;
+
+    private deviceSyncPromise: Promise<{ devices: ConnectedDevice[]; activeDevice: ConnectedDevice | undefined }> | null = null;
+    private lastSyncTime = 0;
+    private cachedSyncResult?: { devices: ConnectedDevice[]; activeDevice: ConnectedDevice | undefined };
+
+    constructor(adbPath: string, context: vscode.ExtensionContext) {
+        this.adbPath = adbPath;
+        this.context = context;
+        this.selectedSerial = context.workspaceState.get<string>('selectedDeviceSerial');
+
+        this.actionsProvider = new ActionsProvider(this);
+        this.devicesProvider = new DevicesProvider(this);
+        this.toolsProvider = new ToolsProvider(this);
+    }
+
+    public setTreeViews(
+        actionsView: vscode.TreeView<vscode.TreeItem>,
+        devicesView: vscode.TreeView<vscode.TreeItem>,
+        toolsView: vscode.TreeView<vscode.TreeItem>
+    ): void {
+        this.actionsTreeView = actionsView;
+        this.devicesTreeView = devicesView;
+        this.toolsTreeView = toolsView;
+    }
+
+    public getAdbPath(): string {
+        return this.adbPath;
+    }
+
+    public getSelectedSerial(): string | undefined {
+        return this.selectedSerial;
+    }
+
+    public setSelectedSerial(serial: string | undefined): void {
+        this.selectedSerial = serial;
+        this.context.workspaceState.update('selectedDeviceSerial', serial);
+        this.refresh();
+    }
+
+    public async syncDevices(forceRefresh: boolean = false): Promise<{ devices: ConnectedDevice[]; activeDevice: ConnectedDevice | undefined }> {
+        const now = Date.now();
+        if (!forceRefresh && this.cachedSyncResult && now - this.lastSyncTime < 1000) {
+            return this.cachedSyncResult;
+        }
+        if (this.deviceSyncPromise) {
+            return this.deviceSyncPromise;
+        }
+
+        this.deviceSyncPromise = (async () => {
+            try {
+                const devices = await listConnectedDevices(this.adbPath);
+                if (devices.length > 0) {
+                    const exists = devices.some(d => d.serial === this.selectedSerial);
+                    if (!exists) {
+                        this.selectedSerial = devices[0].serial;
+                        this.context.workspaceState.update('selectedDeviceSerial', this.selectedSerial);
+                    }
+                } else {
+                    this.selectedSerial = undefined;
+                }
+
+                const activeDevice = devices.find(d => d.serial === this.selectedSerial);
+                const activeLabel = activeDevice ? (activeDevice.model || activeDevice.serial) : '';
+
+                if (this.devicesTreeView) {
+                    this.devicesTreeView.badge = devices.length > 0
+                        ? { value: devices.length, tooltip: `${devices.length} connected device(s)` }
+                        : undefined;
+                }
+                if (this.actionsTreeView) {
+                    this.actionsTreeView.description = activeLabel || undefined;
+                }
+
+                this.cachedSyncResult = { devices, activeDevice };
+                this.lastSyncTime = Date.now();
+                return this.cachedSyncResult;
+            } finally {
+                this.deviceSyncPromise = null;
+            }
+        })();
+
+        return this.deviceSyncPromise;
+    }
 
     public refresh(): void {
-        this.onDidChangeTreeDataEmitter.fire();
+        this.syncDevices(true).then(() => {
+            this.onDidChangeTreeDataEmitter.fire();
+        });
     }
 
     public dispose(): void {
         this.onDidChangeTreeDataEmitter.dispose();
     }
+}
 
-    public getTreeItem(element: vscode.TreeItem): vscode.TreeItem {
+class ActionsProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
+    constructor(private controller: ControllerProvider) {}
+
+    get onDidChangeTreeData(): vscode.Event<void> {
+        return this.controller.onDidChangeTreeData;
+    }
+
+    getTreeItem(element: vscode.TreeItem): vscode.TreeItem {
         return element;
     }
 
-    public getChildren(): vscode.TreeItem[] {
+    async getChildren(): Promise<vscode.TreeItem[]> {
         const appName = getAppName();
-        const open = new vscode.TreeItem(`Open ${appName} Screen`, vscode.TreeItemCollapsibleState.None);
+        const items: vscode.TreeItem[] = [];
+        const { devices, activeDevice } = await this.controller.syncDevices();
+        const activeLabel = activeDevice ? (activeDevice.model || activeDevice.serial) : '';
+        const selectedSerial = this.controller.getSelectedSerial();
+
+        const open = new vscode.TreeItem(
+            activeLabel ? `Open ${appName} Screen (${activeLabel})` : `Open ${appName} Screen`,
+            vscode.TreeItemCollapsibleState.None
+        );
         open.iconPath = new vscode.ThemeIcon('device-mobile');
-        open.command = { command: 'androidWireless.launchVirtualDisplay', title: `Open ${appName} Screen` };
-        open.tooltip = `Open the live ${appName} screen inside the editor`;
+        open.command = {
+            command: 'androidWireless.launchVirtualDisplay',
+            title: `Open ${appName} Screen`,
+            arguments: [selectedSerial]
+        };
+        open.tooltip = activeLabel
+            ? `Open live ${appName} screen on ${activeLabel}`
+            : `Open live ${appName} screen inside the editor`;
+        items.push(open);
 
         const shot = new vscode.TreeItem('Capture screenshot for AI', vscode.TreeItemCollapsibleState.None);
-        shot.iconPath = new vscode.ThemeIcon('camera');
+        shot.iconPath = new vscode.ThemeIcon('device-camera');
         shot.command = { command: 'androidWireless.captureScreenshot', title: 'Capture screenshot' };
         shot.tooltip = 'Save the current frame and copy it for the chat';
+        items.push(shot);
 
-        const deploy = new vscode.TreeItem('Deploy to all devices', vscode.TreeItemCollapsibleState.None);
+        const deploy = new vscode.TreeItem(
+            activeLabel ? `Deploy to ${activeLabel}` : 'Deploy App...',
+            vscode.TreeItemCollapsibleState.None
+        );
         deploy.iconPath = new vscode.ThemeIcon('rocket');
-        deploy.command = { command: 'androidWireless.deployAllDevices', title: 'Deploy to all devices' };
-        deploy.tooltip = 'Build the debug APK and install/launch it on every connected device';
+        deploy.command = {
+            command: 'androidWireless.deployApp',
+            title: 'Deploy App',
+            arguments: [selectedSerial]
+        };
+        deploy.tooltip = activeLabel
+            ? `Deploy to ${activeLabel} (Click to deploy or select target)`
+            : 'Deploy app to connected device';
+        items.push(deploy);
 
-        return [open, shot, deploy];
+        if (devices.length > 1) {
+            const deployAll = new vscode.TreeItem(`Deploy to all devices (${devices.length})`, vscode.TreeItemCollapsibleState.None);
+            deployAll.iconPath = new vscode.ThemeIcon('run-all');
+            deployAll.command = { command: 'androidWireless.deployAllDevices', title: 'Deploy to all devices' };
+            deployAll.tooltip = `Build and install/launch on all ${devices.length} connected devices`;
+            items.push(deployAll);
+        }
+
+        return items;
+    }
+}
+
+class DevicesProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
+    constructor(private controller: ControllerProvider) {}
+
+    get onDidChangeTreeData(): vscode.Event<void> {
+        return this.controller.onDidChangeTreeData;
+    }
+
+    getTreeItem(element: vscode.TreeItem): vscode.TreeItem {
+        return element;
+    }
+
+    async getChildren(): Promise<vscode.TreeItem[]> {
+        const items: vscode.TreeItem[] = [];
+        const { devices } = await this.controller.syncDevices();
+        const selectedSerial = this.controller.getSelectedSerial();
+
+        if (devices.length > 0) {
+            for (const dev of devices) {
+                const isSelected = dev.serial === selectedSerial;
+                const label = dev.model ? dev.model : dev.serial;
+                const devItem = new vscode.TreeItem(label, vscode.TreeItemCollapsibleState.None);
+
+                if (isSelected) {
+                    devItem.iconPath = new vscode.ThemeIcon('pass-filled', new vscode.ThemeColor('charts.green'));
+                    devItem.description = `✓ Active • ${dev.isWireless ? 'Wireless' : 'USB'} (${dev.serial})`;
+                } else {
+                    devItem.iconPath = new vscode.ThemeIcon(dev.isWireless ? 'radio-tower' : 'plug');
+                    devItem.description = `${dev.isWireless ? 'Wireless' : 'USB'} (${dev.serial})`;
+                }
+
+                devItem.tooltip = `${dev.model || dev.serial}\nType: ${dev.isWireless ? 'Wireless' : 'USB'}\nSerial: ${dev.serial}\nStatus: ${isSelected ? 'Active Target (Click for options)' : 'Connected (Click to select/manage)'}`;
+                devItem.command = {
+                    command: 'androidWireless.deviceActions',
+                    title: 'Device Actions',
+                    arguments: [dev]
+                };
+                items.push(devItem);
+            }
+        } else {
+            const noDev = new vscode.TreeItem('⚠️ No device connected', vscode.TreeItemCollapsibleState.None);
+            noDev.description = 'Tap to Connect';
+            noDev.iconPath = new vscode.ThemeIcon('warning');
+            noDev.command = { command: 'androidWireless.connectDevice', title: 'Connect Device' };
+            noDev.tooltip = 'Click to connect a wireless device or pair a new device';
+            items.push(noDev);
+        }
+
+        return items;
+    }
+}
+
+class ToolsProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
+    constructor(private controller: ControllerProvider) {}
+
+    get onDidChangeTreeData(): vscode.Event<void> {
+        return this.controller.onDidChangeTreeData;
+    }
+
+    getTreeItem(element: vscode.TreeItem): vscode.TreeItem {
+        return element;
+    }
+
+    async getChildren(): Promise<vscode.TreeItem[]> {
+        const items: vscode.TreeItem[] = [];
+
+        const pair = new vscode.TreeItem('Pair Device (Wireless Debugging)', vscode.TreeItemCollapsibleState.None);
+        pair.iconPath = new vscode.ThemeIcon('link');
+        pair.command = { command: 'androidWireless.pairDevice', title: 'Pair Device' };
+        pair.tooltip = 'Pair with phone using IP:Port and 6-digit Wi-Fi pairing code';
+        items.push(pair);
+
+        const connect = new vscode.TreeItem('Connect Device (IP:Port)', vscode.TreeItemCollapsibleState.None);
+        connect.iconPath = new vscode.ThemeIcon('radio-tower');
+        connect.command = { command: 'androidWireless.connectDevice', title: 'Connect Device' };
+        connect.tooltip = 'Connect to an already-paired phone via IP and Port';
+        items.push(connect);
+
+        const disconnect = new vscode.TreeItem('Disconnect Wireless Device', vscode.TreeItemCollapsibleState.None);
+        disconnect.iconPath = new vscode.ThemeIcon('debug-disconnect');
+        disconnect.command = { command: 'androidWireless.disconnectDevice', title: 'Disconnect Wireless Device' };
+        disconnect.tooltip = 'Disconnect connected wireless phone';
+        items.push(disconnect);
+
+        const restartAdb = new vscode.TreeItem('Restart ADB Server', vscode.TreeItemCollapsibleState.None);
+        restartAdb.iconPath = new vscode.ThemeIcon('refresh');
+        restartAdb.command = { command: 'androidWireless.refreshDevices', title: 'Restart ADB Server' };
+        restartAdb.tooltip = 'Restart ADB server and refresh device list';
+        items.push(restartAdb);
+
+        return items;
     }
 }
 
@@ -1802,115 +2371,206 @@ class ControllerProvider implements vscode.TreeDataProvider<vscode.TreeItem>, vs
 let mirrorPanel: EmbeddedMirrorPanel | undefined;
 
 export function activate(context: vscode.ExtensionContext) {
+    const adbPath = getAdbPath();
     mirrorPanel = new EmbeddedMirrorPanel(context);
+
+    const controllerProvider = new ControllerProvider(adbPath, context);
+    context.subscriptions.push(controllerProvider);
 
     const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
     statusBar.command = 'androidWireless.launchVirtualDisplay';
-    const updateStatusBar = () => {
+    const updateStatusBar = async () => {
         const appName = getAppName();
-        statusBar.text = `$(device-mobile) ${appName} Screen`;
-        statusBar.tooltip = `Open ${appName} embedded screen inside VS Code`;
+        const activeSerial = controllerProvider.getSelectedSerial();
+        if (activeSerial) {
+            const devices = await listConnectedDevices(adbPath);
+            const activeDev = devices.find(d => d.serial === activeSerial);
+            const label = activeDev ? (activeDev.model || activeDev.serial) : activeSerial;
+            statusBar.text = `$(device-mobile) ${appName}: ${label}`;
+            statusBar.tooltip = `Open ${appName} Screen (${label})\nClick to launch`;
+        } else {
+            statusBar.text = `$(device-mobile) ${appName} Screen`;
+            statusBar.tooltip = `Open ${appName} embedded screen inside VS Code`;
+        }
     };
     updateStatusBar();
     statusBar.show();
     context.subscriptions.push(statusBar);
 
-    const controllerProvider = new ControllerProvider();
-    context.subscriptions.push(controllerProvider);
+    context.subscriptions.push(
+        vscode.commands.registerCommand('androidWireless.launchVirtualDisplay', async (targetInput?: ConnectedDevice | string) => {
+            let targetSerial: string | undefined = typeof targetInput === 'string'
+                ? targetInput
+                : targetInput?.serial;
 
-    const disposable = vscode.commands.registerCommand('androidWireless.launchVirtualDisplay', () => {
-        mirrorPanel?.launch();
-    });
+            if (!targetSerial) {
+                targetSerial = controllerProvider.getSelectedSerial();
+            }
 
-    context.subscriptions.push(disposable);
+            if (!targetSerial) {
+                const devices = await listConnectedDevices(adbPath);
+                if (devices.length > 1) {
+                    const items = devices.map(d => ({
+                        label: `$(device-mobile) ${d.model || d.serial}`,
+                        description: `${d.isWireless ? 'Wireless' : 'USB'} (${d.serial})`,
+                        serial: d.serial
+                    }));
+                    const pick = await vscode.window.showQuickPick(items, {
+                        placeHolder: 'Select device to open screen'
+                    });
+                    if (!pick) return;
+                    targetSerial = pick.serial;
+                } else if (devices.length === 1) {
+                    targetSerial = devices[0].serial;
+                }
+            }
 
-    context.subscriptions.push(vscode.commands.registerCommand('androidWireless.captureScreenshot', () => {
-        mirrorPanel?.captureScreenshot();
-    }));
+            if (targetSerial) {
+                controllerProvider.setSelectedSerial(targetSerial);
+                updateStatusBar();
+            }
+            await mirrorPanel?.launch(targetSerial);
+        })
+    );
 
+    context.subscriptions.push(
+        vscode.commands.registerCommand('androidWireless.captureScreenshot', () => {
+            mirrorPanel?.captureScreenshot();
+        })
+    );
+
+    // Wireless connection commands
+    context.subscriptions.push(
+        vscode.commands.registerCommand('androidWireless.pairDevice', async () => {
+            await pairWirelessDevice(adbPath, context);
+            controllerProvider.refresh();
+            updateStatusBar();
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('androidWireless.connectDevice', async () => {
+            await connectWirelessDevice(adbPath, context);
+            controllerProvider.refresh();
+            updateStatusBar();
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('androidWireless.disconnectDevice', async (targetInput?: ConnectedDevice | string) => {
+            const serial = typeof targetInput === 'string' ? targetInput : targetInput?.serial;
+            await disconnectWirelessDevice(adbPath, serial);
+            controllerProvider.refresh();
+            updateStatusBar();
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('androidWireless.refreshDevices', async () => {
+            await restartAdbServer(adbPath);
+            controllerProvider.refresh();
+            updateStatusBar();
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('androidWireless.selectDevice', async () => {
+            await selectActiveDevice(controllerProvider, adbPath);
+            updateStatusBar();
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('androidWireless.deviceActions', async (dev: ConnectedDevice) => {
+            await showDeviceActions(dev, controllerProvider, adbPath);
+            updateStatusBar();
+        })
+    );
+
+    // Deploy to devices
     const deployOutput = vscode.window.createOutputChannel(`${getAppName()} Deploy`);
-    const deployChannelName = deployOutput.name;
     context.subscriptions.push(deployOutput);
 
-    let deployProcess: cp.ChildProcess | undefined;
-    context.subscriptions.push({
-        dispose: () => {
-            deployProcess?.kill();
-            deployProcess = undefined;
-        }
-    });
+    let isDeploying = false;
 
-    context.subscriptions.push(vscode.commands.registerCommand('androidWireless.deployAllDevices', () => {
-        if (deployProcess) {
+    const executeDeploy = async (targetSerial?: string) => {
+        if (isDeploying) {
             deployOutput.show(true);
-            vscode.window.showWarningMessage(`A deployment is already running. See the "${deployChannelName}" output channel.`);
+            vscode.window.showWarningMessage('A deployment is already running. Please wait for it to complete.');
             return;
         }
 
         const config = vscode.workspace.getConfiguration('suvidha');
         const androidProjectDir = config.get<string>('androidProjectDir', '').trim();
-        const workspaceDir = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-        const projectDir = androidProjectDir || workspaceDir;
+        const appPackage = getAppPackage();
 
-        if (!projectDir) {
-            vscode.window.showErrorMessage(
-                'Open a workspace folder or set suvidha.androidProjectDir before deploying.'
-            );
-            return;
+        isDeploying = true;
+        try {
+            await deployApp({
+                projectDir: androidProjectDir || undefined,
+                appPackage,
+                adbPath,
+                outputChannel: deployOutput,
+                targetSerial
+            });
+        } finally {
+            isDeploying = false;
+            controllerProvider.refresh();
+            updateStatusBar();
         }
+    };
 
-        const scriptPath = context.asAbsolutePath(path.join('scripts', 'deploy_all_devices.sh'));
-        if (!fs.existsSync(scriptPath)) {
-            vscode.window.showErrorMessage(`Deployment script not found: ${scriptPath}`);
-            return;
-        }
+    context.subscriptions.push(
+        vscode.commands.registerCommand('androidWireless.deployApp', async (targetInput?: ConnectedDevice | string) => {
+            let targetSerial: string | undefined = typeof targetInput === 'string'
+                ? targetInput
+                : targetInput?.serial;
 
-        deployOutput.clear();
-        deployOutput.show(true);
-        deployOutput.appendLine(`[deploy] script: ${scriptPath}`);
-        deployOutput.appendLine(`[deploy] cwd: ${workspaceDir ?? projectDir}`);
-        deployOutput.appendLine(`[deploy] ANDROID_PROJECT_DIR: ${androidProjectDir || '(empty - using cwd)'}`);
-        deployOutput.appendLine('');
-
-        const child = spawn('bash', [scriptPath], {
-            cwd: workspaceDir ?? projectDir,
-            env: {
-                ...process.env,
-                ANDROID_PROJECT_DIR: androidProjectDir
-            }
-        });
-
-        deployProcess = child;
-
-        let failedToStart = false;
-
-        child.stdout?.on('data', (data: Buffer) => deployOutput.append(data.toString()));
-        child.stderr?.on('data', (data: Buffer) => deployOutput.append(data.toString()));
-
-        child.on('error', (err) => {
-            failedToStart = true;
-            deployProcess = undefined;
-            deployOutput.appendLine(`\n[deploy] Failed to start deployment: ${err.message}`);
-            vscode.window.showErrorMessage(`Could not start deployment: ${err.message}`);
-        });
-
-        child.on('close', (code, signal) => {
-            deployProcess = undefined;
-
-            if (failedToStart) {
+            const devices = await listConnectedDevices(adbPath);
+            if (devices.length === 0) {
+                vscode.window.showErrorMessage('No active ADB devices found. Connect or pair your phone first.');
                 return;
             }
 
-            if (code === 0) {
-                deployOutput.appendLine('\n[deploy] Deployment finished successfully.');
-                vscode.window.showInformationMessage('Deployment finished successfully on all connected devices.');
-            } else {
-                const reason = signal ? `signal ${signal}` : `exit code ${code}`;
-                deployOutput.appendLine(`\n[deploy] Deployment failed (${reason}).`);
-                vscode.window.showErrorMessage(`Deployment failed (${reason}). See the "${deployChannelName}" output channel.`);
+            if (!targetSerial && devices.length > 1) {
+                const activeSerial = controllerProvider.getSelectedSerial();
+                const items = [
+                    ...devices.map(d => ({
+                        label: `$(device-mobile) ${d.model || d.serial}`,
+                        description: `${d.serial === activeSerial ? '✓ Active • ' : ''}${d.isWireless ? 'Wireless' : 'USB'} (${d.serial})`,
+                        serial: d.serial
+                    })),
+                    {
+                        label: `$(run-all) Deploy to All Devices (${devices.length})`,
+                        description: 'Install and launch on every connected device',
+                        serial: 'ALL'
+                    }
+                ];
+
+                const pick = await vscode.window.showQuickPick(items, {
+                    placeHolder: 'Select deployment target'
+                });
+
+                if (!pick) return;
+                targetSerial = pick.serial;
+            } else if (!targetSerial && devices.length === 1) {
+                targetSerial = devices[0].serial;
             }
-        });
-    }));
+
+            if (targetSerial && targetSerial !== 'ALL') {
+                controllerProvider.setSelectedSerial(targetSerial);
+                updateStatusBar();
+            }
+
+            await executeDeploy(targetSerial === 'ALL' ? undefined : targetSerial);
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('androidWireless.deployAllDevices', async () => {
+            await executeDeploy(undefined);
+        })
+    );
 
     context.subscriptions.push(
         vscode.workspace.onDidChangeConfiguration((e) => {
@@ -1921,9 +2581,24 @@ export function activate(context: vscode.ExtensionContext) {
         })
     );
 
-    context.subscriptions.push(
-        vscode.window.registerTreeDataProvider('androidWirelessDevices', controllerProvider)
-    );
+    const actionsTreeView = vscode.window.createTreeView('androidWirelessActions', {
+        treeDataProvider: controllerProvider.actionsProvider,
+        showCollapseAll: false
+    });
+    const devicesTreeView = vscode.window.createTreeView('androidWirelessDevices', {
+        treeDataProvider: controllerProvider.devicesProvider,
+        showCollapseAll: false
+    });
+    const toolsTreeView = vscode.window.createTreeView('androidWirelessTools', {
+        treeDataProvider: controllerProvider.toolsProvider,
+        showCollapseAll: false
+    });
+
+    controllerProvider.setTreeViews(actionsTreeView, devicesTreeView, toolsTreeView);
+    context.subscriptions.push(actionsTreeView, devicesTreeView, toolsTreeView);
+
+    // Initial sync of device state and badges
+    controllerProvider.syncDevices();
 }
 
 export function deactivate() {

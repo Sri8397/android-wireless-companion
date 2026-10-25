@@ -8,7 +8,7 @@ What Android App in VS Code — SUVIDHA touches on your machine, runs on the pho
 - **Ships its own `scrcpy-server.jar`** (inside the extension) and pushes it to the phone on each session.
 - **Reads**: settings (`suvidha.appName`, `suvidha.appPackage`, `suvidha.virtualDisplay`, `suvidha.keepActive`, `suvidha.inDisplayScrollbar`, `suvidha.androidProjectDir`) and the workspace folder path.
 - **Writes**: `suvidha-screenshots/*.png` — only when you click **Add to chat**.
-- **Deploy command** (only when you run **Deploy to All Connected Devices**): runs the bundled `scripts/deploy_all_devices.sh` with `ANDROID_PROJECT_DIR` set. That script runs `./gradlew assembleDebug` in your Android project, writes Gradle build outputs there, then uses `adb install`, `adb shell am force-stop`, and `adb shell am start` on each connected device. Output goes to the **SUVIDHA Deploy** output channel.
+- **Deploy command** (only when you run **Deploy to All Connected Devices**): builds the debug APK by invoking `./gradlew assembleDebug` in your Android project, then installs and launches it across all connected ADB devices using `adb install`, `am force-stop`, and `am start`. Output streams to the **SUVIDHA Deploy** output channel.
 - **Binds** one TCP listener on `127.0.0.1` (random port), used for the video stream, closed on exit.
 - **Clipboard**: written only by **Add to chat** (PNG, or `@path` fallback).
 - **No** outbound network requests, telemetry, analytics, or accounts.
