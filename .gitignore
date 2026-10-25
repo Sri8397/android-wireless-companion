@@ -1,0 +1,7 @@
+node_modules/
+out/
+*.vsix
+suvidha-screenshots/
+.DS_Store
+.npm-cache/
+.npm-logs/

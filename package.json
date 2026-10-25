@@ -1,0 +1,134 @@
+{
+  "name": "android-wireless-companion",
+  "displayName": "Android App in VS Code — SUVIDHA",
+  "description": "Launches SUVIDHA on an independent Android Virtual Display using scrcpy (sleep-friendly, offline).",
+  "version": "1.0.0",
+  "license": "MIT",
+  "publisher": "srikant",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Sri8397/android-wireless-companion"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "android",
+    "adb",
+    "wireless debugging",
+    "scrcpy",
+    "virtual display"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished",
+    "onView:androidWirelessDevices"
+  ],
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package --no-dependencies"
+  },
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "android-wireless-panel",
+          "title": "SUVIDHA",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "android-wireless-panel": [
+        {
+          "id": "androidWirelessDevices",
+          "name": "Controller"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "androidWireless.launchVirtualDisplay",
+        "title": "Launch SUVIDHA Window",
+        "icon": "$(play)"
+      },
+      {
+        "command": "androidWireless.captureScreenshot",
+        "title": "Capture Screenshot for AI",
+        "icon": "$(camera)",
+        "category": "SUVIDHA"
+      },
+      {
+        "command": "androidWireless.deployAllDevices",
+        "title": "Deploy to All Connected Devices",
+        "icon": "$(rocket)",
+        "category": "SUVIDHA"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "androidWireless.launchVirtualDisplay",
+          "when": "view == androidWirelessDevices",
+          "group": "navigation@1"
+        },
+        {
+          "command": "androidWireless.captureScreenshot",
+          "when": "view == androidWirelessDevices",
+          "group": "navigation@2"
+        },
+        {
+          "command": "androidWireless.deployAllDevices",
+          "when": "view == androidWirelessDevices",
+          "group": "navigation@3"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "SUVIDHA Window",
+      "properties": {
+        "suvidha.appName": {
+          "type": "string",
+          "default": "SUVIDHA",
+          "markdownDescription": "Display name of the Android app shown in the panel title, sidebar, status bar, and prompts."
+        },
+        "suvidha.appPackage": {
+          "type": "string",
+          "default": "com.just_sri.suvidha.expenses",
+          "markdownDescription": "Android package name of the app to launch (for example `com.example.myapp`). Used by `am start`, `am force-stop`, and the launcher intent. Changing it while the screen is open reconnects and launches the new app."
+        },
+        "suvidha.virtualDisplay": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Run SUVIDHA on its own virtual display instead of mirroring the phone screen. The app stays usable while the phone's screen is off or locked."
+        },
+        "suvidha.keepActive": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Keep the phone awake while the panel is open (scrcpy simulates user activity to reset the screen timeout). Without it, the phone sleeps and Android powers off the virtual display."
+        },
+        "suvidha.inDisplayScrollbar": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Enable or disable the in-display scrollbar on the right edge of the phone screen."
+        },
+        "suvidha.androidProjectDir": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Absolute path to the Android project directory containing `gradlew`. Leave empty to use the currently open VS Code workspace directory."
+        }
+      }
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^2.24.0",
+    "typescript": "^5.3.3"
+  }
+}

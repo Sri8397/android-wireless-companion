@@ -1,0 +1,13 @@
+.vscode/**
+.github/**
+.gitignore
+.vscodeignore
+tsconfig.json
+node_modules/**
+src/**
+**/*.map
+suvidha-screenshots/**
+*.vsix
+.npm-cache/**
+.npm-logs/**
+package-lock.json
